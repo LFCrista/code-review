@@ -1,4 +1,3 @@
-# Seu script completo atualizado com negrito e itálico funcionando corretamente:
 import os
 import re
 import sys
@@ -25,23 +24,50 @@ SCOPES = ['https://www.googleapis.com/auth/documents']
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
+# --- Autenticacao Google Docs ---
 def autenticar_google_docs():
     creds = None
+    if not os.path.exists('credentials.json'):
+        messagebox.showinfo("Credenciais", "Selecione o arquivo de credenciais (credentials.json) para continuar.")
+        caminho_credenciais = filedialog.askopenfilename(title="Selecione o arquivo credentials.json", filetypes=[("Arquivo JSON", "*.json")])
+        if not caminho_credenciais:
+            messagebox.showerror("Erro", "Nenhum arquivo de credenciais selecionado. Encerrando.")
+            sys.exit(1)
+        try:
+            with open(caminho_credenciais, 'rb') as src, open('credentials.json', 'wb') as dst:
+                dst.write(src.read())
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao copiar o arquivo de credenciais:\n{e}")
+            sys.exit(1)
+
     if os.path.exists('token.json'):
         try:
             creds = Credentials.from_authorized_user_file('token.json', SCOPES)
         except Exception:
             os.remove('token.json')
             return autenticar_google_docs()
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open('token.json', 'w') as token:
-            token.write(creds.to_json())
+            try:
+                flow = InstalledAppFlow.from_client_secrets_file('credentials.json', SCOPES)
+                creds = flow.run_local_server(port=0)
+                with open('token.json', 'w') as token:
+                    token.write(creds.to_json())
+            except Exception as e:
+                messagebox.showerror("Erro de Autenticação", f"Erro ao autenticar com o Google:\n{e}")
+                sys.exit(1)
+
     return creds
+
+def trocar_credentials():
+    if os.path.exists("credentials.json"):
+        os.remove("credentials.json")
+    if os.path.exists("token.json"):
+        os.remove("token.json")
+    autenticar_google_docs()
 
 def extrair_document_id(link):
     match = re.search(r'/d/([a-zA-Z0-9-_]+)', link)
@@ -166,7 +192,8 @@ def enviar_pdf_para_gpt(page, caminho_pdf):
     except:
         return "__ERRO_ENVIO__"
     time.sleep(4)
-    page.keyboard.type("R1 - T1")
+    prompt = entrada_prompt.get()
+    page.keyboard.type(prompt)
     page.keyboard.press("Enter")
     return esperar_resposta_gpt(page)
 
@@ -217,7 +244,7 @@ def processar_pdfs():
 
         for arquivo in arquivos:
             nome = os.path.basename(arquivo)
-            texto_log.insert(tk.END, f"📄 Processando: {nome}\n")
+            texto_log.insert(tk.END, f"\U0001F4C4 Processando: {nome}\n")
             janela.update()
 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
@@ -240,10 +267,10 @@ def processar_pdfs():
                     texto_log.insert(tk.END, f"❌ Falha ao enviar {nome} ao Docs: {e}\n")
             janela.update()
 
-# Interface Tkinter
+# --- Interface Tkinter ---
 janela = tk.Tk()
 janela.title("Automatizador de PDFs para ChatGPT")
-janela.geometry("600x400")
+janela.geometry("640x480")
 
 frame_botoes = tk.Frame(janela)
 frame_botoes.pack(pady=10)
@@ -253,6 +280,17 @@ botao_abrir_chrome.pack(side=tk.LEFT, padx=10)
 
 botao_processar = tk.Button(frame_botoes, text="Selecionar e Processar PDFs", command=processar_pdfs)
 botao_processar.pack(side=tk.LEFT, padx=10)
+
+botao_trocar_cred = tk.Button(frame_botoes, text="Trocar credentials.json", command=trocar_credentials)
+botao_trocar_cred.pack(side=tk.LEFT, padx=10)
+
+frame_prompt = tk.Frame(janela)
+frame_prompt.pack(pady=5)
+
+tk.Label(frame_prompt, text="Prompt para o ChatGPT:").pack(side=tk.LEFT, padx=5)
+entrada_prompt = tk.Entry(frame_prompt, width=60)
+entrada_prompt.insert(0, "R1 - T1")
+entrada_prompt.pack(side=tk.LEFT)
 
 texto_log = scrolledtext.ScrolledText(janela, width=80, height=20)
 texto_log.pack(pady=10)
