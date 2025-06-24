@@ -1,318 +1,270 @@
-import os, re, sys, time, tkinter as tk, subprocess, asyncio
-from tkinter import filedialog, messagebox, scrolledtext, simpledialog
-from playwright.sync_api import sync_playwright
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from bs4 import BeautifulSoup, NavigableString
+import os
+import subprocess
+import threading
+import tkinter as tk
+from tkinter import (
+    filedialog,
+    scrolledtext,
+    messagebox,
+    ttk,
+)
 
-# ----------- CONFIG --------------------------------------------------
-CHROME_PATH = r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"
-CHROME_USER_DATA_DIR = r"C:\\temp\\chrome"
-CHROME_REMOTE_DEBUGGING_PORT = 9222
-CHROME_DEBUG_URL = f"http://localhost:{CHROME_REMOTE_DEBUGGING_PORT}"
-SCOPES = ["https://www.googleapis.com/auth/documents"]
-if sys.platform.startswith("win"):
-    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-
-# ----------- GOOGLE DOCS --------------------------------------------
-def autenticar_google_docs():
-    if os.path.exists("token.json"):
-        try:
-            return Credentials.from_authorized_user_file("token.json", SCOPES)
-        except Exception:
-            os.remove("token.json")
-    cred = filedialog.askopenfilename(title="credentials.json",
-                                      filetypes=[("JSON", "*.json")])
-    if not cred:
-        return None
-    flow = InstalledAppFlow.from_client_secrets_file(cred, SCOPES)
-    creds = flow.run_local_server(port=0)
-    open("token.json", "w").write(creds.to_json())
-    return creds
+import config
+import auth
+from job_queue import Job
+from pdf_processor import process_pdfs
 
 
-def extrair_document_id(url):
-    m = re.search(r"/d/([A-Za-z0-9-_]+)", url)
-    return m.group(1) if m else None
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
 
+        self.title("Automatizador de PDFs – Fila de Jobs")
+        self.geometry("800x640")
 
-# ----------- HTML ➜ TEXTO / ESTILOS ---------------------------------
-def processar_html(html):
-    soup, txt, est = BeautifulSoup(html, "html.parser"), "", []
+        self.jobs: list[Job] = []
+        self.current_pdfs: list[str] = []
 
-    def add(e, i, f):
-        est.append((e, i, f))
+        self._build_gui()
 
-    def walk(n, a):
-        nonlocal txt
-        if isinstance(n, NavigableString):
-            ini, txt = len(txt), txt + str(n)
-            fim = len(txt)
-            for e in a:
-                add(e, ini, fim)
+    # ----------------------------------------------------------------
+    # GUI builders
+    # ----------------------------------------------------------------
+    def _build_gui(self):
+        self._build_topbar()
+        self._build_inputs()
+        self._build_job_queue()
+        self._build_log()
+
+    def _build_topbar(self):
+        top = tk.Frame(self)
+        top.pack(pady=8, padx=10, anchor="w")
+
+        def abrir_debug():
+            subprocess.Popen(
+                [
+                    config.CHROME_PATH,
+                    f"--remote-debugging-port={config.CHROME_REMOTE_DEBUGGING_PORT}",
+                    f"--user-data-dir={config.CHROME_USER_DATA_DIR}",
+                ]
+            )
+
+        tk.Button(top, text="Abrir Chrome Debug", command=abrir_debug).pack(
+            side=tk.LEFT, padx=5
+        )
+
+        tk.Button(
+            top,
+            text="Trocar credenciais",
+            command=lambda: [
+                os.remove(f)
+                for f in ("token.json", "credentials.json")
+                if os.path.exists(f)
+            ],
+        ).pack(side=tk.LEFT, padx=5)
+
+    def _build_inputs(self):
+        # ----------- Links + prompt + max ----------------------------
+        frm = tk.LabelFrame(self, text="Novo Job")
+        frm.pack(fill="x", padx=10, pady=5, ipadx=5, ipady=5)
+
+        # Linha 0 – link GPT
+        tk.Label(frm, text="Link GPT:").grid(row=0, column=0, sticky="e")
+        self.entry_gpt = tk.Entry(frm, width=80)
+        self.entry_gpt.grid(row=0, column=1, sticky="w", padx=4, pady=2)
+
+        # Linha 1 – link Docs
+        tk.Label(frm, text="Link Docs:").grid(row=1, column=0, sticky="e")
+        self.entry_docs = tk.Entry(frm, width=80)
+        self.entry_docs.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+
+        # Linha 2 – prompt
+        tk.Label(frm, text="Prompt:").grid(row=2, column=0, sticky="e")
+        self.entry_prompt = tk.Entry(frm, width=80)
+        self.entry_prompt.grid(row=2, column=1, sticky="w", padx=4, pady=2)
+
+        # Linha 3 – max PDFs / aba
+        tk.Label(frm, text="Máx. PDFs por aba:").grid(row=3, column=0, sticky="e")
+        self.var_max = tk.StringVar(value="30")
+        tk.Spinbox(
+            frm,
+            from_=1,
+            to=100,
+            width=5,
+            textvariable=self.var_max,
+            increment=1,
+        ).grid(row=3, column=1, sticky="w", padx=4, pady=2)
+
+        # PDFs selecionados
+        self.lbl_pdfs = tk.Label(frm, text="Nenhum PDF selecionado")
+        self.lbl_pdfs.grid(row=4, column=1, sticky="w", padx=4, pady=2)
+
+        btn_select = tk.Button(frm, text="Selecionar PDFs", command=self._select_pdfs)
+        btn_select.grid(row=4, column=0, pady=2)
+
+        # Botão adicionar à fila
+        tk.Button(frm, text="Adicionar à Fila", command=self._add_job).grid(
+            row=5, column=1, sticky="e", pady=4, padx=4
+        )
+
+    def _build_job_queue(self):
+        # ----------- Listagem da fila --------------------------------
+        frm = tk.LabelFrame(self, text="Fila de Jobs")
+        frm.pack(fill="both", expand=False, padx=10, pady=5, ipadx=5, ipady=5)
+
+        self.tree = ttk.Treeview(
+            frm,
+            columns=("gpt", "docs", "pdfs"),
+            show="headings",
+            height=6,
+            selectmode="browse",
+        )
+        self.tree.heading("gpt", text="GPT")
+        self.tree.heading("docs", text="Docs")
+        self.tree.heading("pdfs", text="PDFs")
+        self.tree.column("gpt", width=180)
+        self.tree.column("docs", width=180)
+        self.tree.column("pdfs", width=60, anchor="center")
+        self.tree.pack(side=tk.LEFT, fill="both", expand=True)
+
+        scrollbar = ttk.Scrollbar(frm, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscroll=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill="y")
+
+        # Botões de controle
+        btns = tk.Frame(self)
+        btns.pack(pady=5)
+
+        self.btn_start_queue = tk.Button(
+            btns, text="Executar Fila", command=self._start_queue, state=tk.DISABLED
+        )
+        self.btn_start_queue.pack(side=tk.LEFT, padx=10)
+
+        tk.Button(
+            btns, text="Remover Selecionado", command=self._remove_selected
+        ).pack(side=tk.LEFT, padx=10)
+
+    def _build_log(self):
+        # ----------- Log ---------------------------------------------
+        self.texto_log = scrolledtext.ScrolledText(self, width=100, height=15)
+        self.texto_log.pack(padx=10, pady=10, fill="both", expand=True)
+
+    # ----------------------------------------------------------------
+    # Handlers
+    # ----------------------------------------------------------------
+    def _select_pdfs(self):
+        pdfs = filedialog.askopenfilenames(
+            title="Selecione os PDFs", filetypes=[("PDF", "*.pdf")]
+        )
+        if pdfs:
+            self.current_pdfs = list(pdfs)
+            self.lbl_pdfs.config(text=f"{len(self.current_pdfs)} PDF(s) selecionado(s)")
         else:
-            novo = a + (["bold"] if n.name in ("strong", "b") else []) + \
-                   (["italic"] if n.name in ("em", "i") else [])
-            if n.name == "br":
-                txt += "\n"
-                return
-            for c in n.children:
-                walk(c, novo)
-            if n.name == "p":
-                txt += "\n"
+            self.current_pdfs = []
+            self.lbl_pdfs.config(text="Nenhum PDF selecionado")
 
-    for el in soup.children:
-        walk(el, [])
-    txt += "\n\n"
-    return txt, est
-
-
-def inserir_no_docs(svc, doc, idx, title, html):
-    texto, est = processar_html(html)
-    req = [
-        {"insertText": {"location": {"index": idx}, "text": title + "\n"}},
-        {"updateParagraphStyle": {"range": {"startIndex": idx,
-                                            "endIndex": idx + len(title) + 1},
-                                  "paragraphStyle": {"namedStyleType": "HEADING_1"},
-                                  "fields": "namedStyleType"}},
-        {"insertText": {"location": {"index": idx + len(title) + 1}, "text": texto}}
-    ]
-    for e, s, f in est:
-        style = {"bold": True} if e == "bold" else {"italic": True}
-        req.append({"updateTextStyle": {"range": {"startIndex": idx + len(title) + 1 + s,
-                                                 "endIndex": idx + len(title) + 1 + f},
-                                        "textStyle": style,
-                                        "fields": e}})
-    svc.documents().batchUpdate(documentId=doc, body={"requests": req}).execute()
-    return len(title) + 1 + len(texto)
-
-
-# ----------- PLAYWRIGHT SYNC -----------------------------------------
-def _stop(page):
-    return page.locator("button:has(svg[aria-label='Stop generating'])").count()
-
-
-def _stream(page):
-    return page.locator(".result-streaming, .animate-spin").count()
-
-
-def _composer(page):
-    chips = page.locator("[data-testid='file-upload-preview']").count() or \
-            page.locator("div[role='listitem']").count()
-    if chips:
-        return True
-    ta = page.locator("textarea")
-    if ta.count():
-        try:
-            return bool(ta.input_value().strip())
-        except Exception:
-            return False
-    return False
-
-
-def aguardar_pronto(page, stab=3, buf=1.2):
-    last_cnt = page.locator("[data-message-author-role='assistant']").count()
-    last_html = page.locator("[data-message-author-role='assistant']").nth(-1) \
-        .locator(".markdown").inner_html() if last_cnt else ""
-    fase_buffer, t0 = False, time.time()
-    while True:
-        busy = _stop(page) or _stream(page) or _composer(page)
-        cnt = page.locator("[data-message-author-role='assistant']").count()
-        html = page.locator("[data-message-author-role='assistant']").nth(-1) \
-            .locator(".markdown").inner_html() if cnt else ""
-        mudou = busy or cnt != last_cnt or html != last_html
-        if mudou:
-            fase_buffer, t0 = False, time.time()
-            last_cnt, last_html = cnt, html
-        else:
-            now = time.time()
-            if not fase_buffer and now - t0 >= buf:
-                fase_buffer, t0 = True, now
-            elif fase_buffer and now - t0 >= stab:
-                return
-        time.sleep(0.5)
-
-
-def digitar_prompt(page, prompt):
-    for sel in ("textarea", "div[role='textbox']"):
-        try:
-            page.wait_for_selector(sel, timeout=2000)
-            box = page.locator(sel).first
-            if sel == "textarea":
-                box.evaluate("n=>n.value=''")
-                box.fill(prompt)
-            else:
-                box.click()
-                box.evaluate("n=>n.innerText=''")
-                box.type(prompt)
-            page.keyboard.press("Enter")
-            return
-        except Exception:
-            pass
-    page.keyboard.type(prompt)
-    page.keyboard.press("Enter")
-
-
-def enviar_pdf(page, pdf, prompt):
-    aguardar_pronto(page)
-    prev_cnt = page.locator("[data-message-author-role='assistant']").count()
-
-    # ---- ENVIA ARQUIVO ORIGINAL (sem cópia temporária) ---------------
-    if page.locator("input[type='file']").count():
-        page.set_input_files("input[type='file']", pdf)
-    else:
-        page.click("button:has(svg[aria-label='Upload a file'])", timeout=5000)
-        page.wait_for_selector("input[type='file']", timeout=5000)
-        page.set_input_files("input[type='file']", pdf)
-
-    digitar_prompt(page, prompt)
-
-    while page.locator("[data-message-author-role='assistant']").count() <= prev_cnt:
-        time.sleep(0.5)
-
-    aguardar_pronto(page)
-
-    nova = page.locator("[data-message-author-role='assistant']").nth(-1)
-    page.wait_for_selector("[data-message-author-role='assistant'] >> .markdown", timeout=0)
-    return nova.locator(".markdown").inner_html()
-
-
-def esperar_html_estavel(locator, segundos=2.0, dt=0.4):
-    tam = len(locator.inner_html(timeout=0))
-    t0 = time.time()
-    while True:
-        time.sleep(dt)
-        novo = len(locator.inner_html(timeout=0))
-        if novo != tam:
-            tam, t0 = novo, time.time()
-        elif time.time() - t0 >= segundos:
+    def _add_job(self):
+        if not self.current_pdfs:
+            messagebox.showwarning("Aviso", "Selecione pelo menos um PDF.")
             return
 
+        link_gpt = self.entry_gpt.get().strip()
+        link_doc = self.entry_docs.get().strip()
+        prompt = self.entry_prompt.get().strip()
 
-def esperar_markdown(bolha, dt: float = 0.4):
-    while True:
-        md = bolha.locator(".markdown")
-        if md.count():
-            return md
-        time.sleep(dt)
+        doc_id = auth.extrair_document_id(link_doc)
+        if not all((link_gpt, doc_id, prompt)):
+            messagebox.showerror(
+                "Erro",
+                "Preencha Link GPT, Link Docs (URL válida) e Prompt antes de adicionar.",
+            )
+            return
 
-
-# ------------------- PROCESSAR PDFs ----------------------------------
-def processar():
-    pdfs = filedialog.askopenfilenames(title="PDFs", filetypes=[("PDF", "*.pdf")])
-    if not pdfs:
-        return
-
-    link_gpt = simpledialog.askstring("GPT", "Link da sala GPT:")
-    link_doc = simpledialog.askstring("Docs", "Link do documento:")
-    prompt = campo_prompt.get().strip()
-    doc_id = extrair_document_id(link_doc)
-    if not all((link_gpt, doc_id, prompt)):
-        return
-
-    try:
-        max_per_tab = int(var_max.get())
-        if max_per_tab < 1 or max_per_tab > 100:
+        try:
+            max_per_tab = int(self.var_max.get())
+            if not 1 <= max_per_tab <= 100:
+                max_per_tab = 30
+        except Exception:
             max_per_tab = 30
-    except Exception:
-        max_per_tab = 30
 
-    texto_log.delete("1.0", tk.END)
-    texto_log.insert(tk.END, "Início\n")
-    janela.update()
+        job = Job(
+            pdfs=tuple(self.current_pdfs),
+            link_gpt=link_gpt,
+            doc_id=doc_id,
+            prompt=prompt,
+            max_per_tab=max_per_tab,
+        )
+        self.jobs.append(job)
 
-    svc = build("docs", "v1", credentials=autenticar_google_docs())
-    idx = svc.documents().get(documentId=doc_id).execute()["body"]["content"][-1]["endIndex"] - 1
+        # adiciona na lista visual
+        self.tree.insert(
+            "",
+            "end",
+            iid=len(self.jobs) - 1,
+            values=(link_gpt[:40], link_doc[:40], len(job.pdfs)),
+        )
 
-    with sync_playwright() as p:
-        ctx = p.chromium.connect_over_cdp(CHROME_DEBUG_URL).contexts[0]
-        page = None
+        # limpa seleção atual
+        self.current_pdfs = []
+        self.lbl_pdfs.config(text="Nenhum PDF selecionado")
 
-        for i, pdf in enumerate(pdfs, 1):
-            # ----- ABRE NOVA ABA E FECHA A ANTERIOR -------------------
-            if (i - 1) % max_per_tab == 0:
-                if page and not page.is_closed():   # fecha aba anterior
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-                page = ctx.new_page()               # nova aba
-                page.goto(link_gpt)
-                time.sleep(5)
-            # ----------------------------------------------------------
+        # habilita botão executar
+        self.btn_start_queue.config(state=tk.NORMAL)
 
-            nome = os.path.basename(pdf)
-            texto_log.insert(tk.END, f"➡ {nome}\n")
-            janela.update()
+    def _remove_selected(self):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        idx = int(sel[0])
+        self.tree.delete(sel)
+        self.jobs.pop(idx)
 
-            cnt_before = page.locator("[data-message-author-role='assistant']").count()
-            _ = enviar_pdf(page, pdf, prompt)
+        # reajusta IIDs na TreeView
+        for i, item in enumerate(self.tree.get_children()):
+            self.tree.item(item, tags=())
+            self.tree.detach(item)
+            self.tree.reattach(item, "", i)
+            self.tree.item(item, iid=i)
 
-            bolha = page.locator("[data-message-author-role='assistant']").nth(cnt_before)
-            md = esperar_markdown(bolha)
-            esperar_html_estavel(md)
-            html = md.inner_html()
+        if not self.jobs:
+            self.btn_start_queue.config(state=tk.DISABLED)
 
-            if html.strip():
-                idx += inserir_no_docs(svc, doc_id, idx, nome, html)
-                texto_log.insert(tk.END, "✓ OK\n")
-            else:
-                texto_log.insert(tk.END, "⚠ Sem resposta\n")
+    # ----------------------------------------------------------------
+    # Execução da fila
+    # ----------------------------------------------------------------
+    def _start_queue(self):
+        if not self.jobs:
+            return
 
-            aguardar_pronto(page)
-            janela.update()
+        def worker():
+            self.btn_start_queue.config(state=tk.DISABLED)
 
-        # fecha a última aba ao finalizar (opcional)
-        if page and not page.is_closed():
-            try:
-                page.close()
-            except Exception:
-                pass
+            for idx, job in enumerate(self.jobs):
+                self._log(f"=== Job {idx+1}/{len(self.jobs)} ===\n")
+                try:
+                    process_pdfs(
+                        job.pdfs,
+                        job.link_gpt,
+                        job.doc_id,
+                        job.prompt,
+                        job.max_per_tab,
+                        self.texto_log,
+                        self,
+                    )
+                except Exception as e:
+                    messagebox.showerror("Erro durante processamento", str(e))
+                    self._log(f"!! Job interrompido: {e}\n")
+                    break
+
+            self._log("Fila concluída.\n")
+            self.btn_start_queue.config(state=tk.NORMAL)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _log(self, txt: str):
+        self.texto_log.insert("end", txt)
+        self.texto_log.see("end")
 
 
-# ------------------- INTERFACE ---------------------------------------
-janela = tk.Tk()
-janela.title("Automatizador de PDFs")
-janela.geometry("720x540")
-
-top = tk.Frame(janela)
-top.pack(pady=10)
-
-
-def abrir_debug():
-    subprocess.Popen([CHROME_PATH,
-                      f"--remote-debugging-port={CHROME_REMOTE_DEBUGGING_PORT}",
-                      f"--user-data-dir={CHROME_USER_DATA_DIR}"])
-
-
-tk.Button(top, text="Abrir Chrome Debug", command=abrir_debug).pack(side=tk.LEFT, padx=10)
-tk.Button(top, text="Trocar credenciais",
-          command=lambda: [os.remove(f) for f in ("token.json", "credentials.json") if os.path.exists(f)]) \
-    .pack(side=tk.LEFT)
-
-# Prompt
-frame_prompt = tk.Frame(janela)
-frame_prompt.pack(pady=5)
-tk.Label(frame_prompt, text="Prompt:").pack(side=tk.LEFT)
-campo_prompt = tk.Entry(frame_prompt, width=80)
-campo_prompt.pack(side=tk.LEFT, padx=5)
-
-# ----- NOVO BLOCO -----
-frame_max = tk.Frame(janela)
-frame_max.pack(pady=5)
-tk.Label(frame_max, text="Máx. PDFs por aba:").pack(side=tk.LEFT)
-var_max = tk.StringVar(value="30")
-spin_max = tk.Spinbox(frame_max, from_=1, to=100,
-                      width=5, textvariable=var_max, increment=1)
-spin_max.pack(side=tk.LEFT, padx=5)
-# ----------------------
-
-# Botão principal
-tk.Button(janela, text="Selecionar e Processar PDFs", command=processar).pack(pady=10)
-
-# Log
-texto_log = scrolledtext.ScrolledText(janela, width=90, height=20)
-texto_log.pack(pady=10)
-
-janela.mainloop()
+if __name__ == "__main__":
+    App().mainloop()
